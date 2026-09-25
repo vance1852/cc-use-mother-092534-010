@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -73,22 +74,34 @@ class Database:
         self.path = str(path)
         self.connection = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA foreign_keys = ON")
-        self.connection.execute("PRAGMA busy_timeout = 5000")
-        self.connection.executescript(SCHEMA)
+        # 单连接跨线程共享时，用可重入锁把事务与裸读访问串行化，
+        # 使并发核验/提交在单连接 SQLite 上仍有稳定结果。
+        self._lock = threading.RLock()
+        with self._lock:
+            self.connection.execute("PRAGMA foreign_keys = ON")
+            self.connection.execute("PRAGMA busy_timeout = 5000")
+            self.connection.executescript(SCHEMA)
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
-        """在异常时回滚，在成功时提交。"""
+        """在异常时回滚，在成功时提交；整段持锁串行化。"""
 
-        self.connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-        try:
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            try:
+                yield self.connection
+            except Exception:
+                self.connection.rollback()
+                raise
+            else:
+                self.connection.commit()
+
+    @contextmanager
+    def access(self) -> Iterator[sqlite3.Connection]:
+        """为事务外的只读访问提供同样的串行化保证。"""
+
+        with self._lock:
             yield self.connection
-        except Exception:
-            self.connection.rollback()
-            raise
-        else:
-            self.connection.commit()
 
     def close(self) -> None:
         """关闭底层连接。"""
